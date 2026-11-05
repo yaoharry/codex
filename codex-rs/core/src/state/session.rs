@@ -372,6 +372,26 @@ impl SessionState {
             .advance((self.context_window_id_generator)())
     }
 
+    pub(crate) fn prepare_compaction_window(&self) -> (u64, AutoCompactWindowIds) {
+        let mut window = self.auto_compact_window.clone();
+        window.advance((self.context_window_id_generator)())
+    }
+
+    pub(crate) fn install_prepared_compaction(
+        &mut self,
+        history: ContextManager,
+        invalidate_reviews: bool,
+        window_id: codex_protocol::ContextWindowId,
+    ) {
+        if invalidate_reviews {
+            std::mem::take(&mut self.history_reset).cancel();
+        }
+        self.history = history;
+        self.reasoning_effort_pin = ReasoningEffortPin::Compacted;
+        self.auto_compact_window.advance(window_id);
+        self.auto_compact_window.clear_prefill();
+    }
+
     pub(crate) fn request_new_context_window(&mut self) {
         self.auto_compact_window.request_new_context_window();
     }

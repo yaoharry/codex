@@ -146,6 +146,99 @@ async fn metadata_patch_failure_does_not_partially_apply() {
 }
 
 #[tokio::test]
+async fn append_required_metadata_failure_keeps_canonical_items_exactly_once() {
+    let (_home, store, runtime) = store_with_runtime().await;
+    let thread_id = ThreadId::new();
+    store
+        .stage_pending_thread_metadata(thread_id, staged_model_patch())
+        .await
+        .expect("stage required metadata");
+    let live_thread = LiveThread::create(store.clone(), create_thread_params(thread_id))
+        .await
+        .expect("create live thread");
+    let pool = store
+        .config
+        .sqlite
+        .open_read_write_pool(&store.config.sqlite.state_db_path())
+        .await
+        .expect("open SQL observer");
+    sqlx::query(
+        "CREATE TRIGGER reject_append_metadata BEFORE INSERT ON threads BEGIN SELECT RAISE(ABORT, 'append metadata rejected'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("reject metadata writes");
+    let original = user_message_item("synthetic accepted input \\n UTF-8: 雪");
+    let original_json = serde_json::to_vec(&original).expect("original JSON");
+    let error = live_thread
+        .append_items(std::slice::from_ref(&original))
+        .await
+        .expect_err("metadata failure follows canonical append");
+    assert!(error.to_string().contains("append metadata rejected"));
+    assert_eq!(
+        runtime.get_thread(thread_id).await.expect("metadata read"),
+        None
+    );
+    let path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let (items, _, parse_errors) = RolloutRecorder::load_rollout_items(&path)
+        .await
+        .expect("canonical history");
+    assert_eq!(parse_errors, 0);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| serde_json::to_vec(item).expect("canonical JSON") == original_json)
+            .count(),
+        1,
+        "metadata error does not mean canonical append failed"
+    );
+
+    sqlx::query("DROP TRIGGER reject_append_metadata")
+        .execute(&pool)
+        .await
+        .expect("allow metadata writes");
+    live_thread
+        .flush()
+        .await
+        .expect("repair metadata without replaying append");
+    let newer = user_message_item("newer accepted input");
+    let newer_json = serde_json::to_vec(&newer).expect("newer JSON");
+    live_thread
+        .append_items(std::slice::from_ref(&newer))
+        .await
+        .expect("append newer input");
+    let (items, _, parse_errors) = RolloutRecorder::load_rollout_items(&path)
+        .await
+        .expect("canonical history");
+    assert_eq!(parse_errors, 0);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| serde_json::to_vec(item).expect("canonical JSON") == original_json)
+            .count(),
+        1
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| serde_json::to_vec(item).expect("canonical JSON") == newer_json)
+            .count(),
+        1
+    );
+    assert!(
+        runtime
+            .get_thread(thread_id)
+            .await
+            .expect("metadata read")
+            .is_some()
+    );
+    live_thread.shutdown().await.expect("shutdown writer");
+}
+
+#[tokio::test]
 async fn naming_empty_paginated_thread_materializes_rollout() {
     let (_home, store, runtime) = store_with_runtime().await;
     let thread_id = ThreadId::new();

@@ -1064,6 +1064,136 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
 }
 
 #[tokio::test]
+async fn checkpoint_cancellation_preserves_native_writer_order() -> std::io::Result<()> {
+    #[derive(Clone, Copy, Debug)]
+    enum CancelAt {
+        BeforeQueue,
+        AfterQueue,
+        AfterCommit,
+        AfterWriteFailure,
+    }
+
+    for cancel_at in [
+        CancelAt::BeforeQueue,
+        CancelAt::AfterQueue,
+        CancelAt::AfterCommit,
+        CancelAt::AfterWriteFailure,
+    ] {
+        let home = TempDir::new()?;
+        let blocker = home.path().join("sessions");
+        if matches!(cancel_at, CancelAt::AfterWriteFailure) {
+            File::create(&blocker)?;
+        }
+        let rollout_path = blocker.join("rollout.jsonl");
+        let state = RolloutWriterState {
+            writer: None,
+            deferred_creation: true,
+            pending_items: Vec::new(),
+            meta: None,
+            cwd: home.path().to_path_buf(),
+            rollout_path: rollout_path.clone(),
+            ordinal_state: RolloutOrdinalState::Legacy,
+            last_logged_error: None,
+        };
+        let (tx, rx) = mpsc::channel(if matches!(cancel_at, CancelAt::BeforeQueue) {
+            1
+        } else {
+            4
+        });
+        let recorder = RolloutRecorder {
+            tx,
+            writer_task: Arc::new(RolloutWriterTask::new(None)),
+            rollout_path: rollout_path.clone(),
+        };
+        let original = RolloutItem::ResponseItem(ResponseItemEnvelope::new(
+            serde_json::from_value(serde_json::json!({
+                "type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "protected current input \\n UTF-8: 雪"}
+                ]
+            }))?,
+        ));
+        let newer = RolloutItem::ResponseItem(ResponseItemEnvelope::new(serde_json::from_value(
+            serde_json::json!({
+                "type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "newer accepted input"}
+                ]
+            }),
+        )?));
+        let checkpoint = RolloutItem::Compacted(Box::new(crate::CompactedItem {
+            message: String::new(),
+            replacement_history: Some(vec![match &original {
+                RolloutItem::ResponseItem(item) => item.clone(),
+                _ => unreachable!(),
+            }]),
+            guardian_history: None,
+            retained_context: None,
+            mcp_resource_origins: None,
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            compaction_response_id: Some("synthetic-compaction".to_owned()),
+            latest_token_usage_record: None,
+            resume_metadata: None,
+        }));
+        recorder
+            .record_canonical_items(std::slice::from_ref(&original))
+            .await?;
+        let mut queue_checkpoint =
+            Box::pin(recorder.record_canonical_items(std::slice::from_ref(&checkpoint)));
+        let writer = if matches!(cancel_at, CancelAt::BeforeQueue) {
+            assert!(futures::poll!(queue_checkpoint.as_mut()).is_pending());
+            drop(queue_checkpoint);
+            tokio::spawn(rollout_writer(state, rx))
+        } else {
+            queue_checkpoint.await?;
+            let mut flush = Box::pin(recorder.flush());
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            if matches!(cancel_at, CancelAt::AfterQueue) {
+                drop(flush);
+                recorder
+                    .record_canonical_items(std::slice::from_ref(&newer))
+                    .await?;
+                tokio::spawn(rollout_writer(state, rx))
+            } else {
+                let writer = tokio::spawn(rollout_writer(state, rx));
+                if matches!(cancel_at, CancelAt::AfterWriteFailure) {
+                    flush.await.expect_err("canonical append is still buffered");
+                    assert!(!rollout_path.exists());
+                } else {
+                    flush.await?;
+                }
+                writer
+            }
+        };
+        if !matches!(cancel_at, CancelAt::AfterQueue) {
+            recorder
+                .record_canonical_items(std::slice::from_ref(&newer))
+                .await?;
+        }
+        if matches!(cancel_at, CancelAt::AfterWriteFailure) {
+            fs::remove_file(&blocker)?;
+        }
+        recorder.flush().await?;
+        let (items, _, parse_errors) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+        assert_eq!(parse_errors, 0, "{cancel_at:?}");
+        let expected = if matches!(cancel_at, CancelAt::BeforeQueue) {
+            vec![original, newer]
+        } else {
+            vec![original, checkpoint, newer]
+        };
+        assert_eq!(
+            serde_json::to_vec(&items)?,
+            serde_json::to_vec(&expected)?,
+            "{cancel_at:?}"
+        );
+        recorder.shutdown().await?;
+        writer.await.map_err(std::io::Error::other)??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
