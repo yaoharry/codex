@@ -37,6 +37,7 @@ pub struct HttpClientBuilder {
     http2_prior_knowledge: bool,
     pub(crate) default_headers: Option<HeaderMap>,
     follow_redirects: bool,
+    disable_protocol_retries: bool,
     pub(crate) redirect_observed: Option<Arc<AtomicBool>>,
     pub(crate) connect_timeout: Option<Duration>,
     chatgpt_cloudflare_cookie_store: bool,
@@ -127,6 +128,12 @@ impl HttpClientBuilder {
     /// Use a fresh flag for each operation whose retry safety depends on its redirect history.
     pub fn with_redirect_tracking(mut self, redirect_observed: Arc<AtomicBool>) -> Self {
         self.redirect_observed = Some(redirect_observed);
+        self
+    }
+
+    /// Disables reqwest's internal protocol retries for one explicitly owned operation.
+    pub fn without_protocol_retries(mut self) -> Self {
+        self.disable_protocol_retries = true;
         self
     }
 
@@ -382,6 +389,9 @@ impl HttpClientBuilder {
 
     fn base_reqwest_builder(self) -> reqwest::ClientBuilder {
         let mut builder = reqwest::Client::builder();
+        if self.disable_protocol_retries {
+            builder = builder.retry(reqwest::retry::never());
+        }
         #[cfg(windows)]
         if let Some(path) = self.windows_proxy_pipe_path {
             builder = builder.windows_named_pipe(path);
@@ -428,6 +438,7 @@ impl Default for HttpClientBuilder {
             http2_prior_knowledge: false,
             default_headers: None,
             follow_redirects: true,
+            disable_protocol_retries: false,
             redirect_observed: None,
             connect_timeout: None,
             chatgpt_cloudflare_cookie_store: false,

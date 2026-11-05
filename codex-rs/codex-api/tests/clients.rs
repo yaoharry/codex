@@ -1,4 +1,5 @@
 #![allow(clippy::expect_used)]
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -53,6 +54,7 @@ fn request_body_bytes(request: &Request) -> &[u8] {
 #[derive(Debug, Default, Clone)]
 struct RecordingState {
     stream_requests: Arc<Mutex<Vec<Request>>>,
+    stream_errors: Arc<Mutex<VecDeque<TransportError>>>,
 }
 
 impl RecordingState {
@@ -91,6 +93,15 @@ impl HttpTransport for RecordingTransport {
 
     async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
         self.state.record(req);
+        if let Some(error) = self
+            .state
+            .stream_errors
+            .lock()
+            .expect("stream error queue")
+            .pop_front()
+        {
+            return Err(error);
+        }
 
         let stream = futures::stream::iter(Vec::<Result<Bytes, TransportError>>::new());
         Ok(StreamResponse {
@@ -152,6 +163,352 @@ fn provider(name: &str) -> Provider {
             retry_transport: true,
         },
         stream_idle_timeout: Duration::from_millis(10),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RecoveryAuthMutation {
+    Body,
+    Url,
+    Raw,
+    Compression,
+    Method,
+}
+
+struct MutatingRecoveryAuth(RecoveryAuthMutation);
+
+impl AuthProvider for MutatingRecoveryAuth {
+    fn add_auth_headers(&self, _: &mut HeaderMap) -> Result<(), AuthError> {
+        Ok(())
+    }
+
+    fn apply_auth(&self, mut request: Request) -> codex_api::AuthProviderFuture<'_> {
+        Box::pin(async move {
+            match self.0 {
+                RecoveryAuthMutation::Body => {
+                    request.body = Some(RequestBody::EncodedJson(
+                        codex_client::EncodedJsonBody::encode(
+                            &serde_json::json!({"input":"synthetic-auth-body-marker"}),
+                        )
+                        .expect("synthetic JSON"),
+                    ))
+                }
+                RecoveryAuthMutation::Url => {
+                    request.url.push_str("?synthetic-auth-query-marker=changed")
+                }
+                RecoveryAuthMutation::Raw => {
+                    request.body = Some(RequestBody::Raw(Bytes::copy_from_slice(
+                        request_body_bytes(&request),
+                    )))
+                }
+                RecoveryAuthMutation::Compression => {
+                    request.compression = codex_client::RequestCompression::Zstd
+                }
+                RecoveryAuthMutation::Method => request.method = http::Method::GET,
+            }
+            Ok(request)
+        })
+    }
+}
+
+#[tokio::test]
+async fn body_recovery_rejects_post_auth_request_mutation_before_transport() -> Result<()> {
+    use codex_api::BodyRecoveryOrigin;
+    use codex_protocol::error::BodyRejectionRequestKind;
+    let body = codex_client::EncodedJsonBody::encode(
+        &serde_json::json!({"input":"synthetic-original-body-marker"}),
+    )?;
+    for mutation in [
+        RecoveryAuthMutation::Body,
+        RecoveryAuthMutation::Url,
+        RecoveryAuthMutation::Raw,
+        RecoveryAuthMutation::Compression,
+        RecoveryAuthMutation::Method,
+    ] {
+        let state = RecordingState::default();
+        let client = ResponsesClient::new(
+            RecordingTransport::new(state.clone()),
+            provider("synthetic"),
+            Arc::new(MutatingRecoveryAuth(mutation)),
+        );
+        let error = client
+            .stream_encoded(
+                body.clone(),
+                HeaderMap::new(),
+                Compression::None,
+                None,
+                Some(
+                    BodyRecoveryOrigin::new(BodyRejectionRequestKind::PrefixCompaction, true)
+                        .with_exact_encoded_request(),
+                ),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{mutation:?} must refuse locally"));
+        assert!(
+            state.take_stream_requests().is_empty(),
+            "{mutation:?} must not reach transport"
+        );
+        let rendered = format!("{error:?} {error}");
+        for marker in [
+            "synthetic-original-body-marker",
+            "synthetic-auth-body-marker",
+            "synthetic-auth-query-marker",
+            "example.com",
+        ] {
+            assert!(
+                !rendered.contains(marker),
+                "local ownership error discloses request data"
+            );
+        }
+        assert!(matches!(
+            error,
+            ApiError::Transport(TransportError::Build(_))
+        ));
+    }
+    let state = RecordingState::default();
+    let client = ResponsesClient::new(
+        RecordingTransport::new(state.clone()),
+        provider("synthetic"),
+        Arc::new(NoAuth),
+    );
+    assert!(
+        client
+            .stream_encoded(
+                body,
+                HeaderMap::new(),
+                Compression::Zstd,
+                None,
+                Some(
+                    BodyRecoveryOrigin::new(BodyRejectionRequestKind::PrefixCompaction, true)
+                        .with_exact_encoded_request()
+                )
+            )
+            .await
+            .is_err()
+    );
+    assert!(state.take_stream_requests().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn body_recovery_allows_header_auth_and_preserves_default_request_replacement() -> Result<()>
+{
+    use codex_api::BodyRecoveryOrigin;
+    use codex_protocol::error::BodyRejectionRequestKind;
+    let body = codex_client::EncodedJsonBody::encode(
+        &serde_json::json!({"input":"complete synthetic request"}),
+    )?;
+    let state = RecordingState::default();
+    let client = ResponsesClient::new(
+        RecordingTransport::new(state.clone()),
+        provider("synthetic"),
+        Arc::new(StaticAuth::new("synthetic", "synthetic-account")),
+    );
+    let stream = client
+        .stream_encoded(
+            body.clone(),
+            HeaderMap::new(),
+            Compression::None,
+            None,
+            Some(
+                BodyRecoveryOrigin::new(BodyRejectionRequestKind::Generation, true)
+                    .with_exact_encoded_request(),
+            ),
+        )
+        .await?;
+    drop(stream);
+    let requests = state.take_stream_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(request_body_bytes(&requests[0]), body.as_bytes());
+    assert_eq!(requests[0].url, "https://example.com/v1/responses");
+    assert_eq!(requests[0].method, http::Method::POST);
+    assert_eq!(
+        requests[0].headers[http::header::AUTHORIZATION],
+        "Bearer synthetic"
+    );
+
+    let state = RecordingState::default();
+    let client = ResponsesClient::new(
+        RecordingTransport::new(state.clone()),
+        provider("synthetic"),
+        Arc::new(MutatingRecoveryAuth(RecoveryAuthMutation::Body)),
+    );
+    let stream = client
+        .stream_encoded(
+            body,
+            HeaderMap::new(),
+            Compression::None,
+            None,
+            Some(BodyRecoveryOrigin::new(
+                BodyRejectionRequestKind::Generation,
+                true,
+            )),
+        )
+        .await?;
+    drop(stream);
+    let requests = state.take_stream_requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "ordinary requests retain the default auth contract"
+    );
+    assert!(
+        std::str::from_utf8(request_body_bytes(&requests[0]))?
+            .contains("synthetic-auth-body-marker")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn body_rejection_requires_owned_pristine_http_open_and_exact_encoded_bytes() -> Result<()> {
+    use codex_api::BodyRecoveryOrigin;
+    use codex_client::EncodedJsonBody;
+    use codex_protocol::error::BodyRejectionRequestKind;
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::OK,
+        StatusCode::IM_A_TEAPOT,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        for (origin, mismatch, compression) in [
+            (Some(true), false, Compression::None),
+            (Some(false), false, Compression::None),
+            (None, false, Compression::None),
+            (Some(true), true, Compression::None),
+            (Some(true), false, Compression::Zstd),
+        ] {
+            let state = RecordingState::default();
+            let body = EncodedJsonBody::encode(
+                &serde_json::json!({"model":"synthetic", "input":[{"role":"user", "content":"never-log-this-synthetic-input"}]}),
+            )?;
+            let actual = body.as_bytes().len() as u64;
+            let declared = actual + u64::from(mismatch);
+            let error_body = serde_json::json!({"error_code":"BAD_REQUEST", "message":format!(
+                "Server received a request which exceeds maximum allowed content length. RequestSize(bytes): {declared}, Limit(bytes): {}", actual - 1
+            )}).to_string();
+            state
+                .stream_errors
+                .lock()
+                .unwrap()
+                .push_back(TransportError::Http {
+                    status,
+                    url: None,
+                    headers: None,
+                    body: Some(error_body),
+                    retry_after: None,
+                });
+            let client = ResponsesClient::new(
+                RecordingTransport::new(state.clone()),
+                provider("synthetic"),
+                Arc::new(NoAuth),
+            );
+            let error = client
+                .stream_encoded(
+                    body.clone(),
+                    HeaderMap::new(),
+                    compression,
+                    None,
+                    origin.map(|pristine| {
+                        BodyRecoveryOrigin::new(BodyRejectionRequestKind::Generation, pristine)
+                    }),
+                )
+                .await
+                .err()
+                .expect("pre-stream rejection");
+            let error = codex_api::map_api_error(error);
+            let expected = origin == Some(true)
+                && !mismatch
+                && compression == Compression::None
+                && matches!(
+                    status,
+                    StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE
+                );
+            assert_eq!(
+                error.pre_stream_body_rejection().is_some(),
+                expected,
+                "status={status}, origin={origin:?}, mismatch={mismatch}, compression={compression:?}"
+            );
+            if let Some(rejection) = error.pre_stream_body_rejection() {
+                assert_eq!(rejection.encoded_body().as_bytes(), body.as_bytes());
+                assert_eq!(rejection.status(), status);
+                assert_eq!(rejection.limit_bytes(), actual - 1);
+                assert!(error.retry_delay(1).is_none(), "no unchanged 413 retry");
+                assert!(!format!("{error:?} {error}").contains("never-log-this-synthetic-input"));
+            }
+            let requests = state.take_stream_requests();
+            assert_eq!(requests.len(), 1);
+            if compression == Compression::Zstd {
+                assert_eq!(
+                    requests[0]
+                        .headers
+                        .get(http::header::CONTENT_ENCODING)
+                        .unwrap(),
+                    "zstd"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn body_rejection_after_inner_transport_retry_does_not_authorize_recovery() -> Result<()> {
+    use codex_api::BodyRecoveryOrigin;
+    use codex_client::EncodedJsonBody;
+    use codex_protocol::error::BodyRejectionRequestKind;
+    let state = RecordingState::default();
+    let body = EncodedJsonBody::encode(&serde_json::json!({"input":"synthetic completed input"}))?;
+    let actual = body.as_bytes().len() as u64;
+    state.stream_errors.lock().unwrap().extend([
+        TransportError::Network("synthetic ambiguous transport failure".into()),
+        TransportError::Http { status: StatusCode::PAYLOAD_TOO_LARGE, url: None, headers: None,
+            body: Some(serde_json::json!({"error_code":"BAD_REQUEST", "message":format!(
+                "Server received a request which exceeds maximum allowed content length. RequestSize(bytes): {actual}, Limit(bytes): {}", actual - 1
+            )}).to_string()), retry_after: None,
+        },
+    ]);
+    let mut config = provider("synthetic");
+    config.retry.max_attempts = 2;
+    let client = ResponsesClient::new(
+        RecordingTransport::new(state.clone()),
+        config,
+        Arc::new(NoAuth),
+    );
+    let error = client
+        .stream_encoded(
+            body,
+            HeaderMap::new(),
+            Compression::None,
+            None,
+            Some(BodyRecoveryOrigin::new(
+                BodyRejectionRequestKind::Generation,
+                true,
+            )),
+        )
+        .await
+        .err()
+        .expect("later explicit HTTP rejection");
+    assert!(
+        codex_api::map_api_error(error)
+            .pre_stream_body_rejection()
+            .is_none()
+    );
+    assert_eq!(state.take_stream_requests().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn body_rejection_is_not_inferred_by_global_error_bridge() {
+    for status in [StatusCode::BAD_REQUEST, StatusCode::PAYLOAD_TOO_LARGE] {
+        let error = codex_api::map_api_error(ApiError::Transport(TransportError::Http {
+            status, url: None, headers: None,
+            body: Some(r#"{"error_code":"BAD_REQUEST","message":"Server received a request which exceeds maximum allowed content length. RequestSize(bytes): 65, Limit(bytes): 64"}"#.to_owned()),
+            retry_after: None,
+        }));
+        assert!(error.pre_stream_body_rejection().is_none());
     }
 }
 
@@ -647,6 +1004,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
                 extra_headers,
                 compression: Compression::None,
                 turn_state: None,
+                body_recovery_origin: None,
             },
         )
         .await?;

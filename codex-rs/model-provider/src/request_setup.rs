@@ -86,6 +86,34 @@ pub struct ResolvedProviderRequest {
 }
 
 impl ResolvedProviderRequest {
+    pub fn http_transport_with_redirect_tracking(
+        &self,
+        endpoint: &str,
+        redirect_observed: Arc<std::sync::atomic::AtomicBool>,
+        single_send: bool,
+    ) -> Result<ReqwestTransport> {
+        let redirect_policy = if self
+            .api_provider
+            .headers
+            .contains_key(crate::ACCOUNT_ROUTING_HEADER)
+        {
+            ClientRedirectPolicy::Reject
+        } else {
+            self.redirect_policy
+        };
+        let request_url = self.api_provider.url_for_path(endpoint);
+        let client = codex_login::default_client::create_client_for_route_with_redirect_tracking(
+            &self.http_client_factory,
+            &request_url,
+            ClientRouteClass::Api,
+            redirect_policy,
+            redirect_observed,
+            single_send,
+        )
+        .map_err(std::io::Error::from)?;
+        Ok(ReqwestTransport::from_http_client(client))
+    }
+
     pub fn http_transport(&self, endpoint: &str) -> Result<ReqwestTransport> {
         let redirect_policy = if self
             .api_provider

@@ -133,6 +133,15 @@ pub(crate) struct CompactionTurnMetadata {
 }
 
 impl CompactionTurnMetadata {
+    pub(crate) fn body_limit() -> Self {
+        Self {
+            trigger: CompactionTrigger::Auto,
+            reason: CompactionReason::RequestBodyLimit,
+            implementation: CompactionImplementation::Responses,
+            phase: CompactionPhase::MidTurn,
+            strategy: CompactionStrategy::PrefixCompaction,
+        }
+    }
     pub(crate) fn new(
         trigger: CompactionTrigger,
         reason: CompactionReason,

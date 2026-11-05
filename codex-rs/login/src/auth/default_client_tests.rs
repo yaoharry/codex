@@ -8,6 +8,62 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing_subscriber::layer::SubscriberExt;
 
+#[tokio::test]
+async fn single_send_operation_rejects_redirects_and_preserves_ordinary_policy() {
+    use std::sync::atomic::AtomicBool;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_string;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    for status in [307, 308] {
+        for single_send in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .and(body_string("complete synthetic request"))
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("location", "/redirected"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/redirected"))
+                .and(body_string("complete synthetic request"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(if single_send { 0 } else { 1 })
+                .mount(&server)
+                .await;
+            let url = format!("{}/responses", server.uri());
+            let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+                .with_sensitive_header_protection();
+            let client = create_client_for_route_with_redirect_tracking(
+                &factory,
+                &url,
+                ClientRouteClass::Api,
+                ClientRedirectPolicy::Default,
+                Arc::new(AtomicBool::new(false)),
+                single_send,
+            )
+            .expect("owned route client");
+            let response = client
+                .post(&url)
+                .body("complete synthetic request")
+                .send()
+                .await
+                .expect("owned local HTTP response");
+            assert_eq!(
+                response.status().as_u16(),
+                if single_send { status } else { 200 }
+            );
+            server.verify().await;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TestLogWriter {
     buffer: Arc<Mutex<Vec<u8>>>,

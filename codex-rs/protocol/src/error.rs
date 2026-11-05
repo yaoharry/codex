@@ -34,6 +34,10 @@ use tokio::task::JoinError;
 #[path = "agent_error.rs"]
 mod agent;
 pub use agent::AgentErrorContext;
+#[path = "request_body_rejection.rs"]
+mod request_body_rejection;
+pub use request_body_rejection::BodyRejectionRequestKind;
+pub use request_body_rejection::PreStreamBodyRejection;
 
 pub type Result<T> = std::result::Result<T, CodexErr>;
 
@@ -79,6 +83,7 @@ pub struct CodexErr {
     details: CodexErrorDetails,
     retry_after: Option<RetryAfter>,
     agent_context: Option<AgentErrorContext>,
+    body_rejection: Option<Box<PreStreamBodyRejection>>,
 }
 
 /// A terminal response that stopped before the model finished, with any reported usage.
@@ -279,6 +284,7 @@ impl From<CodexErrorDetails> for CodexErr {
             details,
             retry_after: None,
             agent_context: None,
+            body_rejection: None,
         }
     }
 }
@@ -344,6 +350,7 @@ macro_rules! codex_err_unit_constructors {
                 details: CodexErrorDetails::$variant,
                 retry_after: None,
                 agent_context: None,
+                body_rejection: None,
             };
         )*
     };
@@ -428,6 +435,9 @@ impl CodexErr {
     /// The first retry is attempt one. Retryable errors use server advice when available and
     /// otherwise use exponential backoff with jitter. Callers enforce their own retry budgets.
     pub fn retry_delay(&self, retry_count: u64) -> Option<Duration> {
+        if self.body_rejection.is_some() {
+            return None;
+        }
         match self.details() {
             CodexErrorDetails::TurnAborted
             | CodexErrorDetails::SessionBudgetExceeded
@@ -485,6 +495,16 @@ impl CodexErr {
     /// Returns the original server-advised instant for callers that pass the error on.
     pub fn retry_after(&self) -> Option<RetryAfter> {
         self.retry_after
+    }
+
+    /// Carries HTTP-open provenance without changing the original error category or diagnostics.
+    pub fn with_pre_stream_body_rejection(mut self, rejection: PreStreamBodyRejection) -> Self {
+        self.body_rejection = Some(Box::new(rejection));
+        self
+    }
+
+    pub fn pre_stream_body_rejection(&self) -> Option<&PreStreamBodyRejection> {
+        self.body_rejection.as_deref()
     }
 
     /// Returns the remaining server-advised delay without applying local retry policy.

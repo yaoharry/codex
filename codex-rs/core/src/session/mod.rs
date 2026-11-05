@@ -248,6 +248,10 @@ pub(crate) mod async_compaction;
 pub(crate) mod file_audio;
 pub(crate) use file_audio::FileAudioDurations;
 
+mod body_recovery;
+mod body_recovery_collection;
+mod body_recovery_request;
+mod body_recovery_summary;
 mod code_mode_warning;
 mod config_refresh;
 pub(crate) mod context_window;

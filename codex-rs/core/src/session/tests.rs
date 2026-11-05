@@ -3,6 +3,8 @@ use codex_protocol::ContextWindowId;
 #[path = "compaction_replay_tests.rs"]
 mod compaction_replay_tests;
 
+#[path = "body_recovery_canonical_tests.rs"]
+mod body_recovery_canonical_tests;
 #[path = "body_recovery_checkpoint_tests.rs"]
 mod body_recovery_checkpoint_tests;
 
@@ -28,7 +30,6 @@ use crate::config::RuntimeConfigRefresh;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
 use crate::context::TurnAborted;
-use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;

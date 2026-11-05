@@ -27,6 +27,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         | ApiError::PolicyCapacityUnavailable { retry_after }
         | ApiError::Transport(TransportError::Http { retry_after, .. }) => *retry_after,
         ApiError::Transport(_)
+        | ApiError::BodyRejected { .. }
         | ApiError::Api { .. }
         | ApiError::Stream(_)
         | ApiError::ContentFilter
@@ -54,6 +55,10 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 
 fn map_api_error_details(err: ApiError) -> CodexErr {
     match err {
+        ApiError::BodyRejected { source, rejection } => {
+            map_api_error_details(ApiError::Transport(*source))
+                .with_pre_stream_body_rejection(*rejection)
+        }
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,

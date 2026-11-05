@@ -193,7 +193,7 @@ async fn take_next_stream(
     Some((chunks, completion))
 }
 
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+pub async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 1024];
     loop {
@@ -237,7 +237,7 @@ fn content_length(headers: &str) -> Option<usize> {
     })
 }
 
-async fn read_request_body(
+pub async fn read_request_body(
     stream: &mut tokio::net::TcpStream,
     headers: &str,
     mut body_prefix: Vec<u8>,
@@ -266,7 +266,7 @@ async fn write_sse_headers(stream: &mut tokio::net::TcpStream) -> std::io::Resul
     stream.write_all(headers.as_bytes()).await
 }
 
-async fn write_http_response(
+pub async fn write_http_response(
     stream: &mut tokio::net::TcpStream,
     status: i64,
     body: &str,

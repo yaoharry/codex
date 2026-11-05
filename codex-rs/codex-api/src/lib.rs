@@ -1,5 +1,6 @@
 pub(crate) mod api_bridge;
 pub(crate) mod auth;
+mod body_rejection;
 pub(crate) mod common;
 pub(crate) mod endpoint;
 pub(crate) mod error;
@@ -19,9 +20,12 @@ pub(crate) mod telemetry;
 pub const RESPONSES_PATH: &str = "/responses";
 
 pub use crate::requests::headers::build_session_headers;
+pub use codex_client::EncodedJsonBody;
 pub use codex_client::RequestTelemetry;
 pub use codex_client::ReqwestTransport;
 pub use codex_client::TransportError;
+pub use codex_protocol::error::BodyRejectionRequestKind;
+pub use codex_protocol::error::PreStreamBodyRejection;
 
 pub use crate::api_bridge::map_api_error;
 pub use crate::auth::AgentIdentityTelemetry;
@@ -33,6 +37,7 @@ pub use crate::auth::AuthProviderFuture;
 pub use crate::auth::AuthRefreshFuture;
 pub use crate::auth::SharedAuthProvider;
 pub use crate::auth::auth_header_telemetry;
+pub use crate::body_rejection::BodyRecoveryOrigin;
 pub use crate::common::AccessPrograms;
 pub use crate::common::MemorySummarizeInput;
 pub use crate::common::MemorySummarizeOutput;

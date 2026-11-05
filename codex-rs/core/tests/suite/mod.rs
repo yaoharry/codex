@@ -62,6 +62,14 @@ mod base_instructions;
 mod bedrock_multi_agent;
 #[path = "bedrock_service_tier_tests.rs"]
 mod bedrock_service_tier;
+mod body_rejection_recovery;
+mod body_rejection_recovery_negatives;
+#[path = "body_recovery_network_error.rs"]
+mod body_rejection_recovery_network_error;
+#[path = "body_recovery_preturn.rs"]
+mod body_rejection_recovery_preturn;
+#[path = "body_recovery_spent_turn.rs"]
+mod body_rejection_recovery_spent_turn;
 mod catalog_permission_messages;
 mod cli_stream;
 mod client;
