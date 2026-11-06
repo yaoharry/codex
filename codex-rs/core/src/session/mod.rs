@@ -248,6 +248,10 @@ pub(crate) mod async_compaction;
 pub(crate) mod file_audio;
 pub(crate) use file_audio::FileAudioDurations;
 
+mod body_recovery;
+mod body_recovery_collection;
+mod body_recovery_request;
+mod body_recovery_summary;
 mod code_mode_warning;
 mod config_refresh;
 pub(crate) mod context_window;
@@ -258,6 +262,7 @@ pub(crate) mod extension_metrics;
 mod guardian_checkpoint;
 mod handlers;
 pub(crate) mod inject;
+mod preserving_compaction;
 mod reasoning_effort;
 mod submission;
 pub(crate) use reasoning_effort::RequestEffortUsage;
@@ -4676,31 +4681,8 @@ impl Session {
             CompactedHistoryInstallation::Complete(metadata) => &metadata.compaction_model_hash,
             CompactedHistoryInstallation::Prefix { model_info, .. } => &model_info.comp_hash,
         };
-        crate::model_search::SearchOwner::checkpoint(
-            &self.services.thread_extension_data,
-            &mut items,
-        );
-        let mcp_revision = self
-            .services
-            .executed_tool_calls
-            .mcp_attribution_checkpoint(/*force*/ true)
-            .and_then(|(attribution, revision)| {
-                items.last_mut().map(|envelope| {
-                    envelope.metadata.get_or_insert_default().mcp_attribution = Some(attribution);
-                    revision
-                })
-            });
-        if let Some(checkpoint) = items.iter_mut().rev().find(|envelope| {
-            matches!(
-                envelope.item,
-                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-            )
-        }) {
-            checkpoint
-                .metadata
-                .get_or_insert_default()
-                .compaction_model_hash = compaction_model_hash.clone();
-        }
+        let mcp_revision =
+            self.prepare_compaction_checkpoint_metadata(&mut items, compaction_model_hash);
         // Wait for accepted updates to finish persisting, then keep later updates from
         // overtaking the current settings snapshot while its checkpoint is written.
         let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
@@ -4806,40 +4788,15 @@ impl Session {
                 items,
                 Some(reference_context_item.clone()),
                 HistoryReplacement::Compaction {
-                    reviewer_compaction_hash: metadata.reviewer_compaction_hash,
+                    reviewer_compaction_hash: metadata.reviewer_compaction_hash.clone(),
                 },
             );
             state.reasoning_effort_pin = ReasoningEffortPin::Compacted;
             state
                 .history
                 .set_world_state_baseline(world_state_baseline.clone());
-            let compacted_item = CompactedItem {
-                message: metadata.message,
-                replacement_history: Some(replacement_history),
-                guardian_history: state.history.guardian_history_checkpoint(),
-                retained_context: Some(state.history.retained_context().clone()),
-                mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
-                window_number: Some(metadata.window_number),
-                first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
-                previous_window_id: metadata
-                    .window_ids
-                    .previous_window_id
-                    .map(|id| id.to_string()),
-                window_id: Some(metadata.window_ids.window_id.to_string()),
-                compaction_response_id: metadata.compaction_response_id,
-                latest_token_usage_record: state.latest_token_usage_record.clone(),
-                resume_metadata: Some(CompactionResumeMetadata {
-                    rejected_audio_file_ids: state.history.rejected_audio_file_ids(),
-                    dynamic_tools: Some(Box::new(DynamicToolsSnapshot {
-                        thread_id: self.thread_id(),
-                        tools: state.persisted_dynamic_tools.to_vec(),
-                    })),
-                    multi_agent_version: self.multi_agent_version(),
-                    last_started_turn_id: state.last_started_turn_id.clone(),
-                    turn_attribution: state.turn_attribution.clone(),
-                    previous_turn_settings: state.previous_turn_settings(),
-                }),
-            };
+            let compacted_item =
+                self.compaction_checkpoint(&state, &state.history, replacement_history, metadata);
             (compacted_item, started_item)
         };
 

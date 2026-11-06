@@ -3,6 +3,11 @@ use codex_protocol::ContextWindowId;
 #[path = "compaction_replay_tests.rs"]
 mod compaction_replay_tests;
 
+#[path = "body_recovery_canonical_tests.rs"]
+mod body_recovery_canonical_tests;
+#[path = "body_recovery_checkpoint_tests.rs"]
+mod body_recovery_checkpoint_tests;
+
 #[path = "notification_tests.rs"]
 mod notification_tests;
 
@@ -25,7 +30,6 @@ use crate::config::RuntimeConfigRefresh;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
 use crate::context::TurnAborted;
-use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -4985,7 +4989,7 @@ fn success_flag_true_with_no_error_and_content_used() {
     assert_eq!(expected, got);
 }
 
-async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+async fn initialize_thread_persistence(session: &mut Session) {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
@@ -5024,6 +5028,10 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
     .await
     .expect("create thread persistence");
     session.services.live_thread = Some(live_thread);
+}
+
+async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+    initialize_thread_persistence(session).await;
     session
         .current_rollout_path()
         .await

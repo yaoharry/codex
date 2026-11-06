@@ -11,6 +11,11 @@ use thiserror::Error;
 pub enum ApiError {
     #[error(transparent)]
     Transport(#[from] TransportError),
+    #[error("{source}")]
+    BodyRejected {
+        source: Box<TransportError>,
+        rejection: Box<codex_protocol::error::PreStreamBodyRejection>,
+    },
     #[error("api error {status}: {message}")]
     Api { status: StatusCode, message: String },
     #[error("stream error: {0}")]

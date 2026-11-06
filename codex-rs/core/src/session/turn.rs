@@ -304,6 +304,7 @@ pub(crate) async fn run_turn(
         return Ok(None);
     }
 
+    super::body_recovery::capture_boundary(&sess, &turn_context).await;
     let user_input = turn_user_input(&input);
     let allow_plugin_mentions =
         !crate::guardian::is_basic_session_source(&turn_context.session_source);
@@ -1888,6 +1889,7 @@ async fn run_sampling_request(
     input: crate::context_manager::ContextManager,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<String>)> {
+    client_session.begin_body_recovery_step();
     let turn_context = Arc::clone(&step_context.turn);
     let preempt = step_context.preempt.clone().unwrap_or_default();
     let _input_watch = if let Some(preempt) = &step_context.preempt {
@@ -1922,6 +1924,8 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut notify_messages = Vec::new();
     let mut executed_tool_calls_by_output = HashMap::new();
+    let mut prepared_recovery = None;
+    let mut recovery_claimed = false;
     loop {
         // Running code-mode cells can request review while this response is in flight.
         // Keep the latest received ID until response.created replaces it.
@@ -1937,6 +1941,7 @@ async fn run_sampling_request(
             ..step_context.as_ref().clone()
         });
         let mut prompt_input = history
+            .clone()
             .for_prompt(
                 &step_context.settings.model_info.input_modalities,
                 sess.services.image_store.as_ref(),
@@ -2008,6 +2013,7 @@ async fn run_sampling_request(
             pending_audio,
             input_item_count,
             cancellation_token.child_token(),
+            prepared_recovery.as_ref(),
             &mut draining_for_mailbox,
         )
         .await
@@ -2033,6 +2039,33 @@ async fn run_sampling_request(
                 _ => err,
             },
         };
+
+        // A claimed recovery owns the remaining failure path, including failures before retry.
+        if recovery_claimed {
+            return Err(err);
+        }
+        if let Some(rejection) = err.pre_stream_body_rejection() {
+            recovery_claimed = true;
+            match Box::pin(super::body_recovery::prepare_retry(
+                &sess,
+                &step_context,
+                &history,
+                &responses_metadata,
+                client_session,
+                rejection,
+                &cancellation_token,
+            ))
+            .await
+            {
+                Ok(Some(retry)) => {
+                    prepared_recovery = Some(retry);
+                    turn_context.turn_timing_state.record_sampling_retry();
+                    continue;
+                }
+                Ok(None) => return Err(err),
+                Err(error) => return Err(error),
+            }
+        }
 
         // A steer can preempt retry handling. Finish this terminal failure with the
         // identity from the submitted request before draining any new recordings.
@@ -2881,6 +2914,7 @@ async fn try_run_sampling_request(
     mut pending_audio: Option<codex_history::AcceptedFileAudio>,
     input_item_count: usize,
     cancellation_token: CancellationToken,
+    prepared_recovery: Option<&super::body_recovery::PreparedRetry>,
     draining_for_mailbox: &mut bool,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -2973,20 +3007,46 @@ async fn try_run_sampling_request(
     } else {
         None
     };
-    let stream = client_session
-        .stream(
-            &prompt,
-            &step_context.settings.model_info,
-            &step_context.session_telemetry,
-            effort,
-            step_context.settings.reasoning_summary,
-            step_context.settings.service_tier.clone(),
-            responses_metadata,
-            &inference_trace,
-        )
-        .instrument(trace_span!("stream_request"))
-        .or_cancel(&cancellation_token)
-        .await?;
+    let stream = async {
+        if let Some(retry) = prepared_recovery {
+            if !super::body_recovery::validate_retry(
+                &sess,
+                &step_context,
+                retry,
+                &cancellation_token,
+            )
+            .await
+            {
+                return Err(CodexErr::TurnAborted);
+            }
+            Box::pin(client_session.stream_body_recovery_request(
+                retry.body.clone(),
+                &step_context.settings.model_info,
+                &step_context.session_telemetry,
+                &retry.metadata,
+                retry.owner,
+                codex_protocol::error::BodyRejectionRequestKind::Generation,
+                &inference_trace,
+            ))
+            .await
+        } else {
+            client_session
+                .stream(
+                    &prompt,
+                    &step_context.settings.model_info,
+                    &step_context.session_telemetry,
+                    effort,
+                    step_context.settings.reasoning_summary,
+                    step_context.settings.service_tier.clone(),
+                    responses_metadata,
+                    &inference_trace,
+                )
+                .await
+        }
+    }
+    .instrument(trace_span!("stream_request"))
+    .or_cancel(&cancellation_token)
+    .await?;
     drop(prompt);
     let mut stream = match stream {
         Ok(stream) => stream,
@@ -3490,6 +3550,7 @@ async fn try_run_sampling_request(
                     .await;
                 }
                 response_completed = true;
+                client_session.complete_body_recovery_step();
                 request_token_usage = token_usage.clone();
                 sess.services
                     .analytics_events_client

@@ -2624,6 +2624,13 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
     json!({"type": "error", "status": 400, "error": {"code": "budget_reached"}}),
     CodexErrorInfo::SessionBudgetExceeded; "budget HTTP envelope"
 )]
+#[test_case::test_case(
+    json!({"type": "error", "status": 400, "error": {
+        "type": "invalid_request_error",
+        "message": json!({"error_code":"BAD_REQUEST", "message":"Server received a request which exceeds maximum allowed content length. RequestSize(bytes): 65, Limit(bytes): 64"}).to_string()
+    }}),
+    CodexErrorInfo::Other; "body rejection text in websocket envelope"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
     failure: serde_json::Value,
@@ -2681,6 +2688,15 @@ async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
             error.retry_delay(/*retry_count*/ 1),
         ),
         (expected_error, None),
+    );
+    assert!(
+        error.pre_stream_body_rejection().is_none(),
+        "WebSocket errors have no HTTP-open body ownership"
+    );
+    assert_eq!(
+        server.single_connection().len(),
+        2,
+        "two actual WebSocket model requests without recovery replay"
     );
 
     server.shutdown().await;

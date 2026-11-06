@@ -32,6 +32,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+#[path = "client_body_recovery.rs"]
+mod body_recovery;
 #[path = "client_tool_metadata.rs"]
 mod tool_metadata;
 
@@ -132,6 +134,7 @@ use crate::context::ContextualUserFragment;
 use crate::cyber_access_program;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
@@ -340,11 +343,13 @@ pub struct ModelClientSession {
     /// appends, or continuation requests), and must not send it between different turns.
     /// An auth ownership change clears it so the new owner gets fresh routing state.
     turn_state: Arc<OnceLock<String>>,
+    body_recovery: body_recovery::BodyRecoveryState,
 }
 
 /// Executes HTTP Responses requests without owning a turn's WebSocket state.
 pub(crate) struct ResponsesHttpExecutor<'a> {
     client: &'a ModelClient,
+    body_attempts: Option<Arc<body_recovery::BodyAttemptChain>>,
 }
 
 #[derive(Debug, Clone)]
@@ -744,6 +749,7 @@ impl ModelClient {
             client: self.clone(),
             websocket_session,
             turn_state: Arc::new(OnceLock::new()),
+            body_recovery: Default::default(),
         }
     }
 
@@ -1480,7 +1486,18 @@ impl ModelClientSession {
 
 impl<'a> ResponsesHttpExecutor<'a> {
     pub(crate) fn new(client: &'a ModelClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            body_attempts: None,
+        }
+    }
+
+    fn with_body_attempts(
+        mut self,
+        attempts: Option<Arc<body_recovery::BodyAttemptChain>>,
+    ) -> Self {
+        self.body_attempts = attempts;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1517,6 +1534,7 @@ impl<'a> ResponsesHttpExecutor<'a> {
             },
             compression,
             turn_state: Some(Arc::clone(turn_state)),
+            body_recovery_origin: None,
         }
     }
 }
@@ -1859,7 +1877,14 @@ impl ResponsesHttpExecutor<'_> {
                 .client
                 .responses_headers(client_setup.auth.as_ref(), &model_info.slug);
             tracing::Span::current().record("api.path", "/responses");
-            let transport = client_setup.http_transport("/responses")?;
+            let transport = match &self.body_attempts {
+                Some(chain) => client_setup.http_transport_with_redirect_tracking(
+                    "/responses",
+                    Arc::clone(&chain.redirected),
+                    false,
+                )?,
+                None => client_setup.http_transport("/responses")?,
+            };
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -1943,10 +1968,29 @@ impl ResponsesHttpExecutor<'_> {
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            if matches!(
+                responses_metadata.request_kind,
+                Some(CodexResponsesRequestKind::Turn)
+            ) {
+                options.body_recovery_origin = self.body_attempts.as_ref().map(|chain| {
+                    let owner_matches =
+                        self.client.auth_owner_generation() == client_setup.auth_owner_generation;
+                    let pristine =
+                        chain.enter_http(client_setup.auth_owner_generation) && owner_matches;
+                    codex_api::BodyRecoveryOrigin::new(
+                        codex_protocol::error::BodyRejectionRequestKind::Generation,
+                        pristine,
+                    )
+                    .with_redirect_tracking(Arc::clone(&chain.redirected))
+                });
+            }
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
                 Ok(stream) => {
+                    if let Some(chain) = &self.body_attempts {
+                        chain.opened();
+                    }
                     return Ok(map_response_stream(
                         stream,
                         request_session_telemetry,
@@ -2029,6 +2073,7 @@ impl ModelClientSession {
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
+        self.body_recovery.websocket_attempt();
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
@@ -2452,6 +2497,7 @@ impl ModelClientSession {
                 }
 
                 ResponsesHttpExecutor::new(&self.client)
+                    .with_body_attempts(self.body_recovery.chain.clone())
                     .stream_responses_http(
                         &self.turn_state,
                         /*expected_auth_owner*/ None,

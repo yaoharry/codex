@@ -53,6 +53,7 @@ pub fn extract_response_debug_context(transport: &TransportError) -> ResponseDeb
 pub fn extract_response_debug_context_from_api_error(error: &ApiError) -> ResponseDebugContext {
     match error {
         ApiError::Transport(transport) => extract_response_debug_context(transport),
+        ApiError::BodyRejected { source, .. } => extract_response_debug_context(source),
         _ => ResponseDebugContext::default(),
     }
 }
@@ -73,6 +74,7 @@ pub fn telemetry_transport_error_message(error: &TransportError) -> String {
 pub fn telemetry_api_error_message(error: &ApiError) -> String {
     match error {
         ApiError::Transport(transport) => telemetry_transport_error_message(transport),
+        ApiError::BodyRejected { source, .. } => telemetry_transport_error_message(source),
         ApiError::Api { status, .. } => format!("api error {}", status.as_u16()),
         ApiError::Stream(err) => err.to_string(),
         ApiError::ContentFilter => {
@@ -186,5 +188,45 @@ mod tests {
             "invalid header value"
         );
         assert_eq!(telemetry_api_error_message(&stream), "socket closed");
+    }
+
+    #[test]
+    fn body_rejection_preserves_original_transport_diagnostics_without_request_content() {
+        let body = codex_api::EncodedJsonBody::encode(
+            &serde_json::json!({"input":"synthetic-private-body"}),
+        )
+        .unwrap();
+        let size = body.as_bytes().len() as u64;
+        let rejection = codex_api::PreStreamBodyRejection::from_http_open(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            codex_api::BodyRejectionRequestKind::Generation,
+            size,
+            size - 1,
+            body,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("synthetic-request"),
+        );
+        let error = ApiError::BodyRejected {
+            source: Box::new(TransportError::Http {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                url: None,
+                headers: Some(headers),
+                body: Some("synthetic diagnostic".to_owned()),
+                retry_after: None,
+            }),
+            rejection: Box::new(rejection),
+        };
+        assert_eq!(
+            super::extract_response_debug_context_from_api_error(&error)
+                .request_id
+                .as_deref(),
+            Some("synthetic-request")
+        );
+        assert_eq!(telemetry_api_error_message(&error), "http 413");
+        assert!(!format!("{error:?}").contains("synthetic-private-body"));
     }
 }

@@ -36,6 +36,7 @@ pub struct ResponsesOptions {
     pub extra_headers: HeaderMap,
     pub compression: Compression,
     pub turn_state: Option<Arc<OnceLock<String>>>,
+    pub body_recovery_origin: Option<crate::BodyRecoveryOrigin>,
 }
 
 impl<T: HttpTransport> ResponsesClient<T> {
@@ -72,6 +73,16 @@ impl<T: HttpTransport> ResponsesClient<T> {
         request: ResponsesApiRequest,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
+        let body = EncodedJsonBody::encode(&request)
+            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        self.stream_encoded_request(body, options).await
+    }
+
+    pub async fn stream_encoded_request(
+        &self,
+        body: EncodedJsonBody,
+        options: ResponsesOptions,
+    ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {
             session_id,
             thread_id,
@@ -79,10 +90,8 @@ impl<T: HttpTransport> ResponsesClient<T> {
             extra_headers,
             compression,
             turn_state,
+            body_recovery_origin,
         } = options;
-        let body = EncodedJsonBody::encode(&request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
-
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
             insert_header(&mut headers, "x-client-request-id", thread_id);
@@ -92,7 +101,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
 
-        self.stream_encoded(body, headers, compression, turn_state)
+        self.stream_encoded(body, headers, compression, turn_state, body_recovery_origin)
             .await
     }
 
@@ -116,16 +125,17 @@ impl<T: HttpTransport> ResponsesClient<T> {
     ) -> Result<ResponseStream, ApiError> {
         let body = EncodedJsonBody::encode(&body)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
-        self.stream_encoded(body, extra_headers, compression, turn_state)
+        self.stream_encoded(body, extra_headers, compression, turn_state, None)
             .await
     }
 
-    async fn stream_encoded(
+    pub async fn stream_encoded(
         &self,
         body: EncodedJsonBody,
         extra_headers: HeaderMap,
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
+        body_recovery_origin: Option<crate::BodyRecoveryOrigin>,
     ) -> Result<ResponseStream, ApiError> {
         let request_compression = match compression {
             Compression::None => RequestCompression::None,
@@ -139,6 +149,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
                 "/responses",
                 extra_headers,
                 Some(body),
+                body_recovery_origin,
                 |req| {
                     req.headers.insert(
                         http::header::ACCEPT,

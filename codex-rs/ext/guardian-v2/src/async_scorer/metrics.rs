@@ -29,22 +29,9 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
         LunaSamplerError::InputTooLarge => "input_too_large",
         LunaSamplerError::QueueFull => "queue_full",
         LunaSamplerError::Api(error) => match error {
-            ApiError::Transport(TransportError::Http { status, .. })
-            | ApiError::Api { status, .. } => match status.as_u16() {
-                401 => "http_401",
-                403 => "http_403",
-                429 => "http_429",
-                400..=499 => "http_4xx",
-                500..=599 => "http_5xx",
-                _ => "http_other",
-            },
-            ApiError::Transport(TransportError::Timeout) => "transport_timeout",
-            ApiError::Transport(TransportError::Connection(_)) => "connection_error",
-            ApiError::Transport(TransportError::Network(_)) => "network_error",
-            ApiError::Transport(TransportError::RetryLimit) => "retry_limit",
-            ApiError::Transport(TransportError::Build(_)) => "request_build_error",
-            ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
-            ApiError::Transport(TransportError::Policy(_)) => "network_policy_denied",
+            ApiError::Transport(error) => transport_failure_reason(error),
+            ApiError::BodyRejected { source, .. } => transport_failure_reason(source),
+            ApiError::Api { status, .. } => http_failure_reason(status.as_u16()),
             ApiError::Stream(_) | ApiError::ContentFilter => "stream_error",
             ApiError::ResponseIncomplete(_) => "incomplete_response",
             ApiError::ContextWindowExceeded => "context_window_exceeded",
@@ -64,6 +51,30 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
             ApiError::PolicyCapacityUnavailable { .. } => "policy_capacity_unavailable",
             ApiError::FlexUnavailable => "flex_unavailable",
         },
+    }
+}
+
+fn http_failure_reason(status: u16) -> &'static str {
+    match status {
+        401 => "http_401",
+        403 => "http_403",
+        429 => "http_429",
+        400..=499 => "http_4xx",
+        500..=599 => "http_5xx",
+        _ => "http_other",
+    }
+}
+
+fn transport_failure_reason(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::Http { status, .. } => http_failure_reason(status.as_u16()),
+        TransportError::Timeout => "transport_timeout",
+        TransportError::Connection(_) => "connection_error",
+        TransportError::Network(_) => "network_error",
+        TransportError::RetryLimit => "retry_limit",
+        TransportError::Build(_) => "request_build_error",
+        TransportError::ResponseTooLarge { .. } => "response_too_large",
+        TransportError::Policy(_) => "network_policy_denied",
     }
 }
 
@@ -291,5 +302,46 @@ pub(super) fn record_decisions_comparison(
                 ("decisions", decisions_risk.unwrap_or("unavailable")),
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod body_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn body_rejection_keeps_original_http_failure_classification() {
+        for status in [
+            http::StatusCode::BAD_REQUEST,
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ] {
+            let body = codex_api::EncodedJsonBody::encode(
+                &serde_json::json!({"input":"synthetic private request"}),
+            )
+            .unwrap();
+            let size = body.as_bytes().len() as u64;
+            let rejection = codex_api::PreStreamBodyRejection::from_http_open(
+                status,
+                codex_api::BodyRejectionRequestKind::Generation,
+                size,
+                size - 1,
+                body,
+            )
+            .unwrap();
+            let error = ApiError::BodyRejected {
+                source: Box::new(TransportError::Http {
+                    status,
+                    url: None,
+                    headers: None,
+                    body: Some("synthetic diagnostic".to_owned()),
+                    retry_after: None,
+                }),
+                rejection: Box::new(rejection),
+            };
+            assert_eq!(
+                sampler_failure_reason(&LunaSamplerError::Api(error)),
+                "http_4xx"
+            );
+        }
     }
 }

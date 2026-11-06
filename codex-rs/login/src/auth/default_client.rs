@@ -278,6 +278,34 @@ pub fn create_client_for_route(
     )
 }
 
+/// Keeps ordinary redirect policy; a single-send recovery operation rejects redirect hops.
+pub fn create_client_for_route_with_redirect_tracking(
+    http_client_factory: &HttpClientFactory,
+    request_url: &str,
+    route_class: ClientRouteClass,
+    redirect_policy: ClientRedirectPolicy,
+    redirect_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    single_send: bool,
+) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    let legacy_fallback = redirect_policy == ClientRedirectPolicy::Default
+        || !http_client_factory.protects_sensitive_headers();
+    let mut builder = match redirect_policy {
+        ClientRedirectPolicy::Default => default_http_client_builder(),
+        ClientRedirectPolicy::Reject => default_http_client_builder().without_redirects(),
+    }
+    .with_redirect_tracking(redirect_observed);
+    if single_send {
+        builder = builder.without_protocol_retries().without_redirects();
+    }
+    create_client_for_route_with_builder(
+        http_client_factory,
+        request_url,
+        route_class,
+        builder,
+        legacy_fallback,
+    )
+}
+
 fn create_client_for_route_with_builder(
     http_client_factory: &HttpClientFactory,
     request_url: &str,
