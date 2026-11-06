@@ -80,6 +80,7 @@ struct BodyCapState {
 struct OwnedBodyCap {
     status: u16,
     tighten_summary_cap: bool,
+    limit_only_message: bool,
     state: Arc<Mutex<BodyCapState>>,
 }
 
@@ -143,9 +144,11 @@ impl Respond for OwnedBodyCap {
         if rejected {
             return ResponseTemplate::new(self.status).set_body_json(json!({
                 "error_code": "BAD_REQUEST",
-                "message": format!(
-                    "Server received a request which exceeds maximum allowed content length. RequestSize(bytes): {bytes}, Limit(bytes): {limit}"
-                ),
+                "message": if self.limit_only_message {
+                    format!("The request size exceeds the maximum allowed limit of {limit} bytes. Please reduce the request size and try again.")
+                } else {
+                    format!("Server received a request which exceeds maximum allowed content length. RequestSize(bytes): {bytes}, Limit(bytes): {limit}")
+                },
             }));
         }
         if summary {
@@ -296,14 +299,17 @@ pub(super) fn body_recovery_test_builder(
         })
 }
 
-#[test_case(400, false; "http_400")]
-#[test_case(413, false; "http_413")]
-#[test_case(400, true; "http_400_compaction_cap_decreases")]
-#[test_case(413, true; "http_413_compaction_cap_decreases")]
+#[test_case(400, false, false; "http_400")]
+#[test_case(413, false, false; "http_413")]
+#[test_case(400, true, false; "http_400_compaction_cap_decreases")]
+#[test_case(413, true, false; "http_413_compaction_cap_decreases")]
+#[test_case(400, false, true; "http_400_limit_only")]
+#[test_case(413, false, true; "http_413_limit_only")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn normal_turn_recovers_body_rejection_without_losing_current_input(
     status: u16,
     tighten_summary_cap: bool,
+    limit_only_message: bool,
 ) -> Result<()> {
     let server = responses::start_mock_server().await;
     let state = Arc::new(Mutex::new(BodyCapState::default()));
@@ -312,6 +318,7 @@ async fn normal_turn_recovers_body_rejection_without_losing_current_input(
         .respond_with(OwnedBodyCap {
             status,
             tighten_summary_cap,
+            limit_only_message,
             state: Arc::clone(&state),
         })
         .mount(&server)

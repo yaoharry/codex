@@ -238,12 +238,15 @@ impl<T: HttpTransport> EndpointSession<T> {
                         else {
                             return None;
                         };
-                        let bytes = crate::body_rejection::parse_declared_body_bytes(error_body)?;
                         let observed = observed.lock().ok()?;
                         let (request_url, body) = observed.as_ref()?;
                         if url.as_ref().is_some_and(|url| url != request_url) {
                             return None;
                         }
+                        let bytes = crate::body_rejection::parse_http_open_body_bytes(
+                            error_body,
+                            u64::try_from(body.as_bytes().len()).ok()?,
+                        )?;
                         codex_protocol::error::PreStreamBodyRejection::from_http_open(
                             *status,
                             origin.kind,

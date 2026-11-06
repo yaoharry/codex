@@ -74,6 +74,34 @@ pub(crate) fn parse_declared_body_bytes(raw: &str) -> Option<DeclaredBodyBytes> 
     Some(DeclaredBodyBytes { request, limit })
 }
 
+/// The owning HTTP attempt supplies the measured request size when the gateway omits it.
+pub(crate) fn parse_http_open_body_bytes(
+    raw: &str,
+    encoded_request_bytes: u64,
+) -> Option<DeclaredBodyBytes> {
+    if let Some(bytes) = parse_declared_body_bytes(raw) {
+        return (bytes.request == encoded_request_bytes).then_some(bytes);
+    }
+    let error: FlatBodyError = serde_json::from_str(raw).ok()?;
+    if error.error_code != "BAD_REQUEST" {
+        return None;
+    }
+    let remaining = error
+        .message
+        .strip_prefix("The request size exceeds the maximum allowed limit of ")?;
+    let (limit, remaining) = decimal(remaining)?;
+    if remaining != " bytes. Please reduce the request size and try again."
+        || limit == 0
+        || encoded_request_bytes <= limit
+    {
+        return None;
+    }
+    Some(DeclaredBodyBytes {
+        request: encoded_request_bytes,
+        limit,
+    })
+}
+
 fn skip_ascii_space(value: &str) -> &str {
     let count = value
         .bytes()
@@ -134,6 +162,38 @@ mod tests {
                 limit: 64
             })
         );
+    }
+
+    #[test]
+    fn http_open_body_bytes_bind_limit_only_message_to_measured_request() {
+        let message = "The request size exceeds the maximum allowed limit of 64 bytes. Please reduce the request size and try again.";
+        let raw = json!({"error_code":"BAD_REQUEST", "message":message}).to_string();
+        assert_eq!(parse_declared_body_bytes(&raw), None);
+        assert_eq!(
+            parse_http_open_body_bytes(&raw, 65),
+            Some(DeclaredBodyBytes {
+                request: 65,
+                limit: 64
+            })
+        );
+        for actual in [0, 63, 64] {
+            assert_eq!(parse_http_open_body_bytes(&raw, actual), None);
+        }
+        let declared = json!({"error_code":"BAD_REQUEST", "message":MESSAGE}).to_string();
+        assert!(parse_http_open_body_bytes(&declared, 65).is_some());
+        assert_eq!(parse_http_open_body_bytes(&declared, 66), None);
+        for message in [
+            message.replace("64", "0"),
+            message.replace("64", "-64"),
+            message.replace("64", "+64"),
+            message.replace("64", "64.0"),
+            message.replace("bytes", "tokens"),
+            format!("{message} extra"),
+            format!("prefix {message}"),
+        ] {
+            let raw = json!({"error_code":"BAD_REQUEST", "message":message}).to_string();
+            assert_eq!(parse_http_open_body_bytes(&raw, 65), None);
+        }
     }
 
     #[test]

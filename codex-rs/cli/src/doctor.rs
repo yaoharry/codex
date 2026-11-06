@@ -2505,6 +2505,9 @@ fn websocket_error_detail(err: &ApiError) -> String {
             };
             format!("handshake transport error: {detail}")
         }
+        ApiError::BodyRejected { .. } => {
+            "handshake error: request body limit: [redacted]".to_string()
+        }
         ApiError::Api { status, .. } => format!("handshake API error: {status} [redacted]"),
         ApiError::Stream(_) => "handshake stream error: [redacted]".to_string(),
         ApiError::ResponseIncomplete(_) => {
@@ -3331,6 +3334,9 @@ mod tests {
     fn websocket_error_detail_preserves_categories_without_wire_values() {
         let secret = "private-wire-value";
         let message = || secret.to_string();
+        let rejected_body =
+            codex_api::EncodedJsonBody::encode(&serde_json::json!({"input": secret})).unwrap();
+        let rejected_bytes = u64::try_from(rejected_body.as_bytes().len()).unwrap();
         let cases = [
             ApiError::Transport(TransportError::Http {
                 status: http::StatusCode::FORBIDDEN,
@@ -3342,6 +3348,25 @@ mod tests {
                 body: Some(message()),
                 retry_after: None,
             }),
+            ApiError::BodyRejected {
+                source: Box::new(TransportError::Http {
+                    status: http::StatusCode::PAYLOAD_TOO_LARGE,
+                    url: Some(format!("https://example.com/?token={secret}")),
+                    headers: None,
+                    body: Some(message()),
+                    retry_after: None,
+                }),
+                rejection: Box::new(
+                    codex_protocol::error::PreStreamBodyRejection::from_http_open(
+                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                        codex_protocol::error::BodyRejectionRequestKind::Generation,
+                        rejected_bytes,
+                        1,
+                        rejected_body,
+                    )
+                    .unwrap(),
+                ),
+            },
             ApiError::Transport(TransportError::Network(message())),
             ApiError::Transport(TransportError::Build(message())),
             ApiError::Api {
@@ -3389,6 +3414,7 @@ mod tests {
             details,
             [
                 "handshake transport error: http 403 Forbidden: [redacted]",
+                "handshake error: request body limit: [redacted]",
                 "handshake transport error: network error: [redacted]",
                 "handshake transport error: request build error: [redacted]",
                 "handshake API error: 401 Unauthorized [redacted]",
