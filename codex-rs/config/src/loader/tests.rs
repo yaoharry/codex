@@ -20,6 +20,76 @@ use tempfile::tempdir;
 
 pub(super) struct TestFileSystem;
 
+#[test_case::test_case(false; "missing_directory")]
+#[test_case::test_case(true; "regular_file")]
+#[tokio::test]
+async fn root_checkout_hooks_ignore_absent_config_directory(is_file: bool) -> io::Result<()> {
+    let tmp = tempdir()?;
+    let hooks_folder = AbsolutePathBuf::from_absolute_path(tmp.path().join(".codex"))?;
+    if is_file {
+        tokio::fs::write(hooks_folder.as_path(), "not a config directory").await?;
+    }
+    let config: TomlValue = toml::from_str("model = 'worktree-model'\n[hooks]\nlocal = true")
+        .expect("valid worktree config");
+
+    let merged = merge_root_checkout_project_hooks(
+        &TestFileSystem,
+        config,
+        Some(&hooks_folder),
+        /*is_trusted*/ true,
+    )
+    .await?;
+
+    assert_eq!(
+        merged,
+        toml::from_str::<TomlValue>("model = 'worktree-model'").expect("valid expected config")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_checkout_hooks_retain_config_parse_errors() -> io::Result<()> {
+    let tmp = tempdir()?;
+    let hooks_folder = AbsolutePathBuf::from_absolute_path(tmp.path().join(".codex"))?;
+    tokio::fs::create_dir(hooks_folder.as_path()).await?;
+    tokio::fs::write(hooks_folder.join(CONFIG_TOML_FILE).as_path(), "hooks =").await?;
+
+    let error =
+        load_root_checkout_project_config(&TestFileSystem, &hooks_folder, /*is_trusted*/ true)
+            .await
+            .expect_err("malformed trusted config must fail");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error
+            .to_string()
+            .contains("Error parsing project hooks config file")
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_checkout_hooks_retain_config_read_errors() -> io::Result<()> {
+    let tmp = tempdir()?;
+    let hooks_folder = AbsolutePathBuf::from_absolute_path(tmp.path().join(".codex"))?;
+    let config_file = hooks_folder.join(CONFIG_TOML_FILE);
+    tokio::fs::create_dir_all(config_file.as_path()).await?;
+
+    let error =
+        load_root_checkout_project_config(&TestFileSystem, &hooks_folder, /*is_trusted*/ true)
+            .await
+            .expect_err("a config path that is a directory must fail");
+
+    assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+    assert!(
+        error
+            .to_string()
+            .contains("Failed to read project hooks config file")
+    );
+    Ok(())
+}
+
 #[test]
 fn project_config_cannot_override_configured_credential_broker_hosts() {
     let mut config: TomlValue = toml::from_str(
